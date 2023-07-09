@@ -6,13 +6,11 @@ import (
 	"strconv"
 
 	"github.com/hyperledger/fabric-chaincode-go/shim"
-	// "github.com/hyperledger/fabric-contract-api-go/contractapi"
 	pb "github.com/hyperledger/fabric-protos-go/peer"
 )
 
 // SmartContract provides functions for managing a Patient
 type SmartContract struct {
-	// contractapi.Contract
 }
 
 // PatientData describes basic details of what makes up a simple Patient
@@ -22,11 +20,12 @@ type CounterNO struct {
 }
 
 type User struct {
-	Username string `json:"Username"`
-	UserID   string `json:"UserID"`
-	Email    string `json:"Email"`
-	UserRole string `json:"UserRole"`
-	Password string `json:"Password"`
+	Username           string `json:"Username"`
+	UserID             string `json:"UserID"`
+	Email              string `json:"Email"`
+	UserRole           string `json:"UserRole"`
+	Password           string `json:"Password"`
+	IsCreationComplete bool   `json:"IsCreationComplete"`
 }
 
 type PatientData struct {
@@ -65,17 +64,14 @@ func (t *SmartContract) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		//create a new patient
 		age, _ := strconv.Atoi(args[2])
 
-		access := make(map[string]bool)
+		var access map[string]bool
 		json.Unmarshal([]byte(args[6]), &access)
-		fmt.Printf("access %v", access)
 
-		diagnosehistory := []string{}
+		var diagnosehistory []string
 		json.Unmarshal([]byte(args[9]), &diagnosehistory)
-		fmt.Printf("diagnosehistory %v", diagnosehistory)
 
-		medicationhistory := []string{}
-		json.Unmarshal([]byte(args[10]), &medicationhistory)
-		fmt.Printf("medicationhistory %v", medicationhistory)
+		var medicationhistory []string
+		json.Unmarshal([]byte(args[9]), &medicationhistory)
 
 		return t.CreatePatient(stub, args[0], args[1], age, args[3], args[4], args[5], access, args[7], args[8], diagnosehistory, medicationhistory)
 	} else if function == "updatePatientMedicalRecords" {
@@ -97,14 +93,6 @@ func (t *SmartContract) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		// delete the patient EHR
 		return t.DeletePatient(stub, args[0])
 	}
-	// else if function == "patientExists" {
-	// 	// check if the patient exists
-	// 	return t.PatientExists(stub, args[0])
-	// }
-	//  else if function == "hasPermission" {
-	// 	// check if the provider has permission to access the EHR
-	// 	return t.hasPermission(stub, args[0], args[1])
-	// }
 
 	fmt.Println("invoke did not find func: " + function)
 	//error
@@ -243,7 +231,7 @@ func (t *SmartContract) createUser(APIstub shim.ChaincodeStubInterface, args []s
 	userCounter := getCounter(APIstub, "UserCounterNO")
 	userCounter++
 
-	var createdUser = User{Username: args[0], UserID: "User" + strconv.Itoa(userCounter), Email: args[1], UserRole: args[2], Password: args[3]}
+	var createdUser = User{Username: args[0], UserID: "User" + strconv.Itoa(userCounter), Email: args[1], UserRole: args[2], Password: args[3], IsCreationComplete: false}
 
 	createdUserAsBytes, errMarshal := json.Marshal(createdUser)
 
@@ -300,6 +288,13 @@ func (s *SmartContract) CreatePatient(APIstub shim.ChaincodeStubInterface, patie
 		fmt.Errorf("failed to put to world state. %v", err)
 		return shim.Error("Failed to put to world state")
 	}
+
+	updated, err := s.UpdateUserComplete(APIstub, patientID)
+	if !updated || err != nil {
+		fmt.Errorf("failed to update user. %v", err)
+		return shim.Error("Failed to update user")
+	}
+
 	return shim.Success(PatientJSON)
 }
 
@@ -363,13 +358,13 @@ func (s *SmartContract) UpdatePatientMedicalRecords(APIstub shim.ChaincodeStubIn
 // ReadPatient returns the Medical info only stored in the world state with given id.
 func (s *SmartContract) ReadPatientMedicalInfo(APIstub shim.ChaincodeStubInterface, providerID string, patientID string) pb.Response {
 
-	PatientRecordJSON, err := APIstub.GetState(patientID)
+	PatientJSON, err := APIstub.GetState(patientID)
 	if err != nil {
 		fmt.Errorf("failed to read from world state: %v", err)
 		return shim.Error("failed to read from world state")
 
 	}
-	if PatientRecordJSON == nil {
+	if PatientJSON == nil {
 		fmt.Errorf("the patient %s does not exist", patientID)
 		return shim.Error("the patient does not exist")
 
@@ -382,7 +377,7 @@ func (s *SmartContract) ReadPatientMedicalInfo(APIstub shim.ChaincodeStubInterfa
 	}
 
 	var Patient PatientData
-	err = json.Unmarshal(PatientRecordJSON, &Patient)
+	err = json.Unmarshal(PatientJSON, &Patient)
 	if err != nil {
 		fmt.Errorf("failed to unmarshal patient data %s", err)
 		return shim.Error("failed to unmarshal patient data")
@@ -396,6 +391,12 @@ func (s *SmartContract) ReadPatientMedicalInfo(APIstub shim.ChaincodeStubInterfa
 	fmt.Println("Medication history:")
 	for _, history := range Patient.Record.MedicationsHistory {
 		fmt.Printf("- %s\n", history)
+	}
+
+	PatientRecordJSON, err := json.Marshal(Patient.Record)
+	if err != nil {
+		fmt.Errorf("failed to marshal patient record %s", err)
+		return shim.Error("failed to marshal patient record")
 	}
 
 	return shim.Success(PatientRecordJSON)
@@ -585,6 +586,39 @@ func (s *SmartContract) hasPermission(APIstub shim.ChaincodeStubInterface, userI
 	}
 	if access == false {
 		return false, fmt.Errorf("%s doesn't have access to %s", userID, patientID)
+	}
+
+	return true, nil
+}
+
+func (s *SmartContract) UpdateUserComplete(APIstub shim.ChaincodeStubInterface, userID string) (bool, error) {
+
+	// Retrieve user data from the ledger
+	userDataJSON, err := APIstub.GetState("user_" + userID)
+	if err != nil {
+		return false, fmt.Errorf("failed to read user data from world state: %v", err)
+	}
+	if userDataJSON == nil {
+		return false, fmt.Errorf("user data with ID %s does not exist", userID)
+	}
+
+	// Unmarshal user data JSON into struct
+	var userData User
+	err = json.Unmarshal(userDataJSON, &userData)
+	if err != nil {
+		return false, fmt.Errorf("failed to unmarshal user data JSON: %v", err)
+	}
+
+	userData.IsCreationComplete = true
+
+	updatedUserData, err := json.Marshal(userData)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal updated user: %v", err)
+	}
+
+	err = APIstub.PutState("user_"+userID, updatedUserData)
+	if err != nil {
+		return false, fmt.Errorf("failed to update user: %v", err)
 	}
 
 	return true, nil
